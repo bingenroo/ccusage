@@ -4,8 +4,10 @@ title Claude Code Usage Monitor
 rem ---------------------------------------------------------------
 rem  Claude Code usage monitor (live, in-place refresh)
 rem  Usage:
-rem    claude-usage.bat           refresh every 10s
-rem    claude-usage.bat 5         refresh every 5s
+rem    claude-usage.bat                refresh every 30s (or whatever config says)
+rem    claude-usage.bat 5              override interval to 5s
+rem    claude-usage.bat noconfig       launch with default settings, ignore config
+rem    claude-usage.bat 5 noconfig     both
 rem ---------------------------------------------------------------
 
 rem Set a compact window before any output (cols x rows).
@@ -34,10 +36,20 @@ if not exist "%~dp0claude-usage.ps1" (
     exit /b 1
 )
 
-set "INTERVAL=%~1"
-if "%INTERVAL%"=="" set "INTERVAL=10"
+set "INTERVAL="
+set "NOCFG="
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0claude-usage.ps1" -Interval %INTERVAL%
+if /I "%~1"=="noconfig" (
+    set "NOCFG=-NoConfig"
+) else if not "%~1"=="" (
+    set "INTERVAL=-Interval %~1"
+)
+
+if /I "%~2"=="noconfig" (
+    set "NOCFG=-NoConfig"
+)
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0claude-usage.ps1" %INTERVAL% %NOCFG%
 set "PSEXIT=%ERRORLEVEL%"
 
 echo.
