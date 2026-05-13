@@ -8,19 +8,16 @@
 #   - direct hotkeys: q quit, r refresh-now, p pause
 #
 # Bash 3.2 compatible (so macOS's stock /bin/bash works).
-# Requires: jq, curl, awk, ccusage on PATH.
+# Requires: jq, curl, awk on PATH.
 
 set -u
 
 # ----------------------------------------------------------------------------
 # Dep checks
 # ----------------------------------------------------------------------------
-for dep in jq curl awk ccusage; do
+for dep in jq curl awk; do
     if ! command -v "$dep" >/dev/null 2>&1; then
         printf 'Error: %s not found on PATH.\n' "$dep" >&2
-        if [[ "$dep" == "ccusage" ]]; then
-            printf 'Install with: npm i -g ccusage\n' >&2
-        fi
         exit 1
     fi
 done
@@ -59,7 +56,7 @@ trap cleanup EXIT INT TERM
 # ----------------------------------------------------------------------------
 # Defaults
 # ----------------------------------------------------------------------------
-DEF_INTERVAL=30
+DEF_INTERVAL=0
 DEF_TITLE="Claude Code Usage Monitor"
 DEF_DATEFMT="%Y-%m-%d %H:%M:%S"
 DEF_COLS=36
@@ -70,12 +67,9 @@ DEF_THEME="default"
 DEF_BAR_STYLE="block"
 DEF_SHOW_WEEKLY=true
 DEF_SHOW_SONNET=true
-DEF_SHOW_BURNRATE=true
-DEF_SHOW_COST=true
 DEF_COMPACT=false
 DEF_ALERT_THRESHOLD=80
 DEF_SPINNER=true
-DEF_FORCE_LOCAL=false
 
 # Active config (loaded / mutated at runtime)
 CFG_INTERVAL=$DEF_INTERVAL
@@ -89,12 +83,9 @@ CFG_THEME="$DEF_THEME"
 CFG_BAR_STYLE="$DEF_BAR_STYLE"
 CFG_SHOW_WEEKLY=$DEF_SHOW_WEEKLY
 CFG_SHOW_SONNET=$DEF_SHOW_SONNET
-CFG_SHOW_BURNRATE=$DEF_SHOW_BURNRATE
-CFG_SHOW_COST=$DEF_SHOW_COST
 CFG_COMPACT=$DEF_COMPACT
 CFG_ALERT_THRESHOLD=$DEF_ALERT_THRESHOLD
 CFG_SPINNER=$DEF_SPINNER
-CFG_FORCE_LOCAL=$DEF_FORCE_LOCAL
 
 # ----------------------------------------------------------------------------
 # Config load / save
@@ -118,12 +109,9 @@ load_config() {
     v=$(jq -r '.barStyle        // empty' "$CFG_FILE"); [[ -n "$v" ]] && CFG_BAR_STYLE="$v"
     v=$(jq -r '.showWeekly      // empty' "$CFG_FILE"); [[ -n "$v" ]] && CFG_SHOW_WEEKLY="$v"
     v=$(jq -r '.showSonnet      // empty' "$CFG_FILE"); [[ -n "$v" ]] && CFG_SHOW_SONNET="$v"
-    v=$(jq -r '.showBurnRate    // empty' "$CFG_FILE"); [[ -n "$v" ]] && CFG_SHOW_BURNRATE="$v"
-    v=$(jq -r '.showCost        // empty' "$CFG_FILE"); [[ -n "$v" ]] && CFG_SHOW_COST="$v"
     v=$(jq -r '.compactMode     // empty' "$CFG_FILE"); [[ -n "$v" ]] && CFG_COMPACT="$v"
     v=$(jq -r '.alertThreshold  // empty' "$CFG_FILE"); [[ -n "$v" ]] && CFG_ALERT_THRESHOLD="$v"
     v=$(jq -r '.spinner         // empty' "$CFG_FILE"); [[ -n "$v" ]] && CFG_SPINNER="$v"
-    v=$(jq -r '.forceLocalMode  // empty' "$CFG_FILE"); [[ -n "$v" ]] && CFG_FORCE_LOCAL="$v"
 }
 
 save_config() {
@@ -142,12 +130,9 @@ save_config() {
   "barStyle": "${CFG_BAR_STYLE}",
   "showWeekly": ${CFG_SHOW_WEEKLY},
   "showSonnet": ${CFG_SHOW_SONNET},
-  "showBurnRate": ${CFG_SHOW_BURNRATE},
-  "showCost": ${CFG_SHOW_COST},
   "compactMode": ${CFG_COMPACT},
   "alertThreshold": ${CFG_ALERT_THRESHOLD},
-  "spinner": ${CFG_SPINNER},
-  "forceLocalMode": ${CFG_FORCE_LOCAL}
+  "spinner": ${CFG_SPINNER}
 }
 JSON
     mv "$tmp" "$CFG_FILE" 2>/dev/null || return 1
@@ -156,19 +141,19 @@ JSON
 
 snapshot_config() {
     # Returns one-line snapshot we can restore from
-    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
         "$CFG_INTERVAL" "$CFG_TITLE" "$CFG_DATEFMT" "$CFG_COLS" "$CFG_ROWS" \
         "$CFG_CORNER" "$CFG_ALWAYS_ON_TOP" "$CFG_THEME" "$CFG_BAR_STYLE" \
-        "$CFG_SHOW_WEEKLY" "$CFG_SHOW_SONNET" "$CFG_SHOW_BURNRATE" "$CFG_SHOW_COST" \
-        "$CFG_COMPACT" "$CFG_ALERT_THRESHOLD" "$CFG_SPINNER" "$CFG_FORCE_LOCAL"
+        "$CFG_SHOW_WEEKLY" "$CFG_SHOW_SONNET" \
+        "$CFG_COMPACT" "$CFG_ALERT_THRESHOLD" "$CFG_SPINNER"
 }
 
 restore_config() {
     local s="$1"
     IFS='|' read -r CFG_INTERVAL CFG_TITLE CFG_DATEFMT CFG_COLS CFG_ROWS \
         CFG_CORNER CFG_ALWAYS_ON_TOP CFG_THEME CFG_BAR_STYLE \
-        CFG_SHOW_WEEKLY CFG_SHOW_SONNET CFG_SHOW_BURNRATE CFG_SHOW_COST \
-        CFG_COMPACT CFG_ALERT_THRESHOLD CFG_SPINNER CFG_FORCE_LOCAL <<<"$s"
+        CFG_SHOW_WEEKLY CFG_SHOW_SONNET \
+        CFG_COMPACT CFG_ALERT_THRESHOLD CFG_SPINNER <<<"$s"
 }
 
 # ----------------------------------------------------------------------------
@@ -423,31 +408,36 @@ get_token() {
     jq -r '.claudeAiOauth.accessToken // empty' "$CRED_FILE" 2>/dev/null
 }
 
-# Background fetch: writes ${TMP_DIR}/blocks.json, weekly.json, quota.json, then .done
-spawn_fetch() {
-    local token="$1" skip_quota="$2"
-    rm -f "$TMP_DIR/.done"
-    (
-        ccusage blocks --offline -j -t max  > "$TMP_DIR/blocks.json" 2>/dev/null
-        ccusage weekly --offline -j -o desc > "$TMP_DIR/weekly.json" 2>/dev/null
-        if [[ -n "$token" && "$skip_quota" != "true" ]]; then
-            curl -fsS --max-time 10 \
-                -H "Authorization: Bearer ${token}" \
-                -H "anthropic-beta: oauth-2025-04-20" \
-                -H "User-Agent: claude-code/2.0.31" \
-                -H "Accept: application/json" \
-                "https://api.anthropic.com/api/oauth/usage" \
-                > "$TMP_DIR/quota.json" 2>/dev/null || rm -f "$TMP_DIR/quota.json"
-        else
-            rm -f "$TMP_DIR/quota.json"
-        fi
-        touch "$TMP_DIR/.done"
-    ) &
-    FETCH_PID=$!
-}
-
-fetch_done() {
-    [[ -f "$TMP_DIR/.done" ]]
+# Synchronous fetch: writes ${TMP_DIR}/quota.json on success, ${TMP_DIR}/quota.err on failure.
+fetch_quota() {
+    local token="$1"
+    rm -f "$TMP_DIR/quota.err"
+    if [[ -z "$token" ]]; then
+        rm -f "$TMP_DIR/quota.json"
+        echo "no OAuth token in ~/.claude/.credentials.json" > "$TMP_DIR/quota.err"
+        return 1
+    fi
+    local code
+    code=$(curl -s -o "$TMP_DIR/quota.json" -w "%{http_code}" --max-time 10 \
+        -H "Authorization: Bearer ${token}" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        -H "User-Agent: claude-code/2.0.31" \
+        -H "Accept: application/json" \
+        "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
+    if [[ "$code" == "200" ]]; then
+        return 0
+    fi
+    rm -f "$TMP_DIR/quota.json"
+    local msg
+    case "$code" in
+        429)    msg="429 rate limited" ;;
+        401)    msg="401 expired token" ;;
+        403)    msg="403 forbidden" ;;
+        000|"") msg="network error" ;;
+        *)      msg="HTTP $code" ;;
+    esac
+    echo "$msg" > "$TMP_DIR/quota.err"
+    return 1
 }
 
 # ISO timestamp to "minutes remaining" — handles GNU & BSD `date`.
@@ -480,8 +470,6 @@ render_frame() {
 
     update_layout
 
-    local blocks="$TMP_DIR/blocks.json"
-    local weekly="$TMP_DIR/weekly.json"
     local quota="$TMP_DIR/quota.json"
 
     local now
@@ -526,17 +514,6 @@ render_frame() {
                 if awk -v r="$sess_rem" 'BEGIN { exit !(r >= 0) }'; then
                     info="Resets in $(fmt_dur "$sess_rem")"
                 fi
-                if [[ -s "$blocks" ]] && jq -e '.blocks[]|select(.isActive==true)' "$blocks" >/dev/null 2>&1; then
-                    local tu co
-                    tu=$(jq -r '[.blocks[]|select(.isActive==true)][0].totalTokens // 0' "$blocks")
-                    co=$(jq -r '[.blocks[]|select(.isActive==true)][0].costUSD     // 0' "$blocks")
-                    [[ -n "$info" ]] && info+="  "
-                    if [[ "$CFG_SHOW_COST" == "true" ]]; then
-                        info+="$(fmt_tokens "$tu") tok  \$$(printf '%.2f' "$co")"
-                    else
-                        info+="$(fmt_tokens "$tu") tok"
-                    fi
-                fi
                 out+="${INDENT}${GRY}$(truncate_vis "$info")${R}${EOLN}"$'\n'
             fi
         else
@@ -545,24 +522,6 @@ render_frame() {
             out+="${INDENT}${YEL}$(truncate_vis "$msg")${R}${EOLN}"$'\n'
             out+="${EOLN}"$'\n'
             [[ "$CFG_COMPACT" != "true" ]] && out+="${EOLN}"$'\n'
-        fi
-
-        # Burn rate
-        if [[ "$CFG_SHOW_BURNRATE" == "true" && "$CFG_COMPACT" != "true" ]]; then
-            if [[ -s "$blocks" ]] && jq -e '.blocks[]|select(.isActive==true)' "$blocks" >/dev/null 2>&1; then
-                local bt bh
-                bt=$(jq -r '[.blocks[]|select(.isActive==true)][0].burnRate.tokensPerMinute // 0' "$blocks")
-                bh=$(jq -r '[.blocks[]|select(.isActive==true)][0].burnRate.costPerHour     // 0' "$blocks")
-                local burn
-                if [[ "$CFG_SHOW_COST" == "true" ]]; then
-                    burn="Burn $(fmt_tokens "$bt")/m | \$$(printf '%.2f' "$bh")/h"
-                else
-                    burn="Burn $(fmt_tokens "$bt")/m"
-                fi
-                out+="${INDENT}${GRY}$(truncate_vis "$burn")${R}${EOLN}"$'\n'
-            else
-                out+="${EOLN}"$'\n'
-            fi
         fi
 
         [[ "$CFG_COMPACT" != "true" ]] && out+="${EOLN}"$'\n'
@@ -586,17 +545,6 @@ render_frame() {
                     local info=""
                     if awk -v r="$wk_rem" 'BEGIN { exit !(r >= 0) }'; then
                         info="Resets in $(fmt_dur "$wk_rem")"
-                    fi
-                    if [[ -s "$weekly" ]] && jq -e '.weekly[0]' "$weekly" >/dev/null 2>&1; then
-                        local tt tc
-                        tt=$(jq -r '.weekly[0].totalTokens // 0' "$weekly")
-                        tc=$(jq -r '.weekly[0].totalCost   // 0' "$weekly")
-                        [[ -n "$info" ]] && info+="  "
-                        if [[ "$CFG_SHOW_COST" == "true" ]]; then
-                            info+="$(fmt_tokens "$tt") tok  \$$(printf '%.2f' "$tc")"
-                        else
-                            info+="$(fmt_tokens "$tt") tok"
-                        fi
                     fi
                     out+="${INDENT}${GRY}$(truncate_vis "$info")${R}${EOLN}"$'\n'
                 fi
@@ -630,20 +578,6 @@ render_frame() {
                     if awk -v r="$sn_rem" 'BEGIN { exit !(r >= 0) }'; then
                         info="Resets in $(fmt_dur "$sn_rem")"
                     fi
-                    # local sonnet tokens from weekly model breakdowns
-                    if [[ -s "$weekly" ]] && jq -e '.weekly[0].modelBreakdowns' "$weekly" >/dev/null 2>&1; then
-                        local stk sct
-                        stk=$(jq -r '[.weekly[0].modelBreakdowns[] | select(.modelName|test("sonnet";"i")) | (.inputTokens + .outputTokens + .cacheCreationTokens + .cacheReadTokens)] | add // 0' "$weekly")
-                        sct=$(jq -r '[.weekly[0].modelBreakdowns[] | select(.modelName|test("sonnet";"i")) | .cost] | add // 0' "$weekly")
-                        if awk -v s="$stk" 'BEGIN { exit !(s > 0) }'; then
-                            [[ -n "$info" ]] && info+="  "
-                            if [[ "$CFG_SHOW_COST" == "true" ]]; then
-                                info+="$(fmt_tokens "$stk") tok  \$$(printf '%.2f' "$sct")"
-                            else
-                                info+="$(fmt_tokens "$stk") tok"
-                            fi
-                        fi
-                    fi
                     out+="${INDENT}${GRY}$(truncate_vis "$info")${R}${EOLN}"$'\n'
                 fi
             else
@@ -664,8 +598,16 @@ render_frame() {
             else                             src="Quota: live API"; fi
             out+="${INDENT}${GRY}$(truncate_vis "$src")${R}${EOLN}"$'\n'
         else
-            local src="API unavailable - retrying next fetch"
-            [[ $CONTENT_W -lt 38 ]] && src="API unavailable"
+            local err_msg=""
+            [[ -s "$TMP_DIR/quota.err" ]] && err_msg=$(cat "$TMP_DIR/quota.err")
+            local src
+            if [[ -n "$err_msg" ]]; then
+                src="API err: $err_msg"
+            elif [[ $CONTENT_W -lt 38 ]]; then
+                src="API unavailable"
+            else
+                src="API unavailable - retrying next fetch"
+            fi
             out+="${INDENT}${YEL}$(truncate_vis "$src")${R}${EOLN}"$'\n'
         fi
     else
@@ -686,7 +628,11 @@ render_frame() {
         status="${spin_ch} refreshing data..."
         out+="${INDENT}${CYA}$(truncate_vis "$status")${R}${EOLN}"$'\n'
     elif [[ "$ever_fetched" == "true" ]]; then
-        if [[ $CONTENT_W -ge 38 ]]; then status="next in ${secs_until_next}s | c menu  q quit"
+        if [[ $CFG_INTERVAL -le 0 ]]; then
+            if   [[ $CONTENT_W -ge 38 ]]; then status="Enter to refresh | c menu  q quit"
+            elif [[ $CONTENT_W -ge 24 ]]; then status="Enter refresh | c menu"
+            else                              status="Enter refresh"; fi
+        elif [[ $CONTENT_W -ge 38 ]]; then status="next in ${secs_until_next}s | c menu  q quit"
         elif [[ $CONTENT_W -ge 24 ]]; then status="next ${secs_until_next}s | c menu"
         else                              status="next ${secs_until_next}s"; fi
         out+="${INDENT}${GRY}$(truncate_vis "$status")${R}${EOLN}"$'\n'
@@ -736,10 +682,10 @@ read_key() {
 # Setup menu (BIOS-style)
 # ----------------------------------------------------------------------------
 # Menu schema as parallel arrays (bash 3.2 — no associative arrays)
-MENU_KEYS=(   interval    theme    corner    dimensions    alwaysOnTop    title    dateFormat    barStyle    showWeekly    showSonnet    showBurnRate    showCost    compactMode    alertThreshold    spinner    forceLocalMode)
-MENU_LABELS=( "Refresh interval" "Color theme" "Window corner" "Window size" "Always on top" "Title" "Date/time format" "Bar style" "Show Weekly" "Show Sonnet" "Show Burn rate" "Show Cost" "Compact mode" "Alert threshold" "Spinner" "Force local mode" )
+MENU_KEYS=(   interval    theme    corner    dimensions    alwaysOnTop    title    dateFormat    barStyle    showWeekly    showSonnet    compactMode    alertThreshold    spinner)
+MENU_LABELS=( "Refresh interval" "Color theme" "Window corner" "Window size" "Always on top" "Title" "Date/time format" "Bar style" "Show Weekly" "Show Sonnet" "Compact mode" "Alert threshold" "Spinner" )
 MENU_HELPS=(
-    "Refresh interval (5-3600 sec)"
+    "0 = manual (Enter to fetch), else 5-3600 sec"
     "default / dark / mono / high-contrast"
     "Screen corner where the window parks"
     "Window size as cols x rows (e.g. 48x28)"
@@ -749,14 +695,11 @@ MENU_HELPS=(
     "block / ascii / braille glyphs"
     "Show the 7-day quota panel"
     "Show the Weekly Sonnet panel"
-    "Show tokens-per-minute burn line"
-    'Display $ cost amounts'
     "Hide info sub-lines for a shorter UI"
     "Bar turns red when % is at/above this"
     "Animated spinner glyph (reduced motion)"
-    "Skip OAuth API call - use peak fallback"
 )
-MENU_TYPES=(  int         cycle    cycle     dims          bool           text     cycleText     cycle       bool          bool          bool            bool        bool           int               bool       bool          )
+MENU_TYPES=(  int         cycle    cycle     dims          bool           text     cycleText     cycle       bool          bool          bool           int               bool       )
 
 THEMES="default dark mono high-contrast"
 CORNERS="BottomLeft BottomRight TopRight TopLeft"
@@ -828,12 +771,9 @@ get_cfg() {
         barStyle)        echo "$CFG_BAR_STYLE" ;;
         showWeekly)      echo "$CFG_SHOW_WEEKLY" ;;
         showSonnet)      echo "$CFG_SHOW_SONNET" ;;
-        showBurnRate)    echo "$CFG_SHOW_BURNRATE" ;;
-        showCost)        echo "$CFG_SHOW_COST" ;;
         compactMode)     echo "$CFG_COMPACT" ;;
         alertThreshold)  echo "$CFG_ALERT_THRESHOLD" ;;
         spinner)         echo "$CFG_SPINNER" ;;
-        forceLocalMode)  echo "$CFG_FORCE_LOCAL" ;;
         dimensions)      echo "${CFG_COLS} x ${CFG_ROWS}" ;;
     esac
 }
@@ -849,12 +789,9 @@ set_cfg() {
         barStyle)        CFG_BAR_STYLE="$2" ;;
         showWeekly)      CFG_SHOW_WEEKLY="$2" ;;
         showSonnet)      CFG_SHOW_SONNET="$2" ;;
-        showBurnRate)    CFG_SHOW_BURNRATE="$2" ;;
-        showCost)        CFG_SHOW_COST="$2" ;;
         compactMode)     CFG_COMPACT="$2" ;;
         alertThreshold)  CFG_ALERT_THRESHOLD="$2" ;;
         spinner)         CFG_SPINNER="$2" ;;
-        forceLocalMode)  CFG_FORCE_LOCAL="$2" ;;
     esac
 }
 
@@ -879,7 +816,8 @@ format_menu_value() {
         int)
             local v; v=$(get_cfg "$k")
             case "$k" in
-                interval)       echo "${v}s" ;;
+                interval)
+                    if [[ "$v" == "0" ]]; then echo "manual"; else echo "${v}s"; fi ;;
                 alertThreshold) echo "${v}%" ;;
                 *)              echo "$v" ;;
             esac
@@ -935,8 +873,11 @@ edit_item() {
             if [[ "$nv" =~ ^[0-9]+$ ]]; then
                 case "$k" in
                     interval)
-                        [[ $nv -lt 5 ]] && nv=5
-                        [[ $nv -gt 3600 ]] && nv=3600
+                        # 0 is a valid sentinel (manual mode); otherwise clamp.
+                        if [[ $nv -ne 0 ]]; then
+                            [[ $nv -lt 5 ]] && nv=5
+                            [[ $nv -gt 3600 ]] && nv=3600
+                        fi
                         ;;
                     alertThreshold)
                         [[ $nv -lt 0 ]] && nv=0
@@ -979,12 +920,9 @@ reset_item() {
         barStyle)        CFG_BAR_STYLE="$DEF_BAR_STYLE" ;;
         showWeekly)      CFG_SHOW_WEEKLY=$DEF_SHOW_WEEKLY ;;
         showSonnet)      CFG_SHOW_SONNET=$DEF_SHOW_SONNET ;;
-        showBurnRate)    CFG_SHOW_BURNRATE=$DEF_SHOW_BURNRATE ;;
-        showCost)        CFG_SHOW_COST=$DEF_SHOW_COST ;;
         compactMode)     CFG_COMPACT=$DEF_COMPACT ;;
         alertThreshold)  CFG_ALERT_THRESHOLD=$DEF_ALERT_THRESHOLD ;;
         spinner)         CFG_SPINNER=$DEF_SPINNER ;;
-        forceLocalMode)  CFG_FORCE_LOCAL=$DEF_FORCE_LOCAL ;;
         dimensions)      CFG_COLS=$DEF_COLS; CFG_ROWS=$DEF_ROWS ;;
     esac
     apply_config
@@ -1228,31 +1166,32 @@ PAUSED=false
 FORCE_REFRESH=false
 SPIN_IDX=0
 LAST_W=-1
-FETCH_PID=""
 
 printf '%s' "$HIDE"
 clear
 
-spawn_fetch "$TOKEN" "$CFG_FORCE_LOCAL"
+# First fetch is synchronous before entering the render loop.
+fetch_quota "$TOKEN" || true
+LAST_FETCH=$(date +%s)
+EVER_FETCHED=true
 
 while true; do
-    # Reap finished fetch
-    if [[ -n "$FETCH_PID" ]] && fetch_done; then
-        wait "$FETCH_PID" 2>/dev/null || true
-        FETCH_PID=""
-        LAST_FETCH=$(date +%s)
-        EVER_FETCHED=true
-    fi
-
     NOW=$(date +%s)
     if [[ $LAST_FETCH -eq 0 ]]; then ELAPSED=99999; else ELAPSED=$((NOW - LAST_FETCH)); fi
     SECS_LEFT=$(( CFG_INTERVAL - ELAPSED ))
     [[ $SECS_LEFT -lt 0 ]] && SECS_LEFT=0
 
-    if [[ -z "$FETCH_PID" && "$EVER_FETCHED" == "true" && "$PAUSED" != "true" ]] && \
-       { [[ $ELAPSED -ge $CFG_INTERVAL ]] || [[ "$FORCE_REFRESH" == "true" ]]; }; then
-        spawn_fetch "$TOKEN" "$CFG_FORCE_LOCAL"
-        FORCE_REFRESH=false
+    # interval=0 disables auto-polling; only FORCE_REFRESH (Enter / 'r') fires a fetch.
+    # Manual refresh is debounced to ~2s so spamming Enter can't hit the rate limit.
+    AUTO_DUE=false
+    [[ $CFG_INTERVAL -gt 0 && $ELAPSED -ge $CFG_INTERVAL ]] && AUTO_DUE=true
+    MANUAL_DUE=false
+    [[ "$FORCE_REFRESH" == "true" && $ELAPSED -ge 2 ]] && MANUAL_DUE=true
+    FORCE_REFRESH=false
+    if [[ "$PAUSED" != "true" ]] && \
+       { [[ "$AUTO_DUE" == "true" ]] || [[ "$MANUAL_DUE" == "true" ]]; }; then
+        fetch_quota "$TOKEN" || true
+        LAST_FETCH=$(date +%s)
     fi
 
     CUR_W=$(tput cols 2>/dev/null || echo "$CONTENT_W_DEFAULT")
@@ -1267,9 +1206,7 @@ while true; do
         command -v wmctrl >/dev/null 2>&1 && wmctrl -r :ACTIVE: -b add,above >/dev/null 2>&1
     fi
 
-    FETCHING=false
-    [[ -n "$FETCH_PID" ]] && FETCHING=true
-    render_frame "$FETCHING" "$SECS_LEFT" "$SPIN_IDX" "$EVER_FETCHED" "$PAUSED"
+    render_frame "false" "$SECS_LEFT" "$SPIN_IDX" "$EVER_FETCHED" "$PAUSED"
     SPIN_IDX=$((SPIN_IDX + 1))
 
     # Key-poll slice loop (10 x 0.1s = 1s frame cadence)
@@ -1283,7 +1220,7 @@ while true; do
                     LAST_W=-1
                     break ;;
                 q|Q) SHOULD_QUIT=true; break ;;
-                r|R) FORCE_REFRESH=true; break ;;
+                r|R|ENTER) FORCE_REFRESH=true; break ;;
                 p|P) if [[ "$PAUSED" == "true" ]]; then PAUSED=false; else PAUSED=true; fi; break ;;
             esac
         fi

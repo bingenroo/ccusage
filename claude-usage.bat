@@ -17,16 +17,6 @@ echo  Claude Code Usage Monitor
 echo  ----------------------------
 echo  Starting up...
 
-where ccusage >nul 2>&1
-if errorlevel 1 (
-    echo.
-    echo [ERROR] ccusage not found on PATH.
-    echo Install with:  npm i -g ccusage
-    echo.
-    pause
-    exit /b 1
-)
-
 if not exist "%~dp0claude-usage.ps1" (
     echo.
     echo [ERROR] claude-usage.ps1 not found next to this bat.

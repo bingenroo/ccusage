@@ -1,5 +1,5 @@
 param(
-    [int]$Interval = 0,
+    [int]$Interval = -1,
     [switch]$NoConfig
 )
 
@@ -141,7 +141,7 @@ $script:ConfigParseError = $false
 function Get-DefaultConfig {
     return [pscustomobject]@{
         version        = 1
-        interval       = 30
+        interval       = 0
         title          = 'Claude Code Usage Monitor'
         dateFormat     = 'yyyy-MM-dd HH:mm:ss'
         dimensions     = [pscustomobject]@{ cols = 36; rows = 24 }
@@ -151,12 +151,9 @@ function Get-DefaultConfig {
         barStyle       = 'block'
         showWeekly     = $true
         showSonnet     = $true
-        showBurnRate   = $true
-        showCost       = $true
         compactMode    = $false
         alertThreshold = 80
         spinner        = $true
-        forceLocalMode = $false
     }
 }
 
@@ -369,33 +366,33 @@ function Get-OAuthToken {
     } catch { return $null }
 }
 
-function Start-FetchJob([string]$token, [bool]$skipQuotaApi) {
-    return Start-Job -ArgumentList $token, $skipQuotaApi -ScriptBlock {
-        param($tok, $skip)
-        # Background jobs have their own runspace - re-enable TLS 1.2 here.
-        try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-        $b = $null; $w = $null; $q = $null; $qErr = $null
-        try { $b = (& ccusage blocks --offline -j -t max 2>$null) -join "`n" } catch {}
-        try { $w = (& ccusage weekly --offline -j -o desc 2>$null) -join "`n" } catch {}
-        if ($tok -and -not $skip) {
-            try {
-                $headers = @{
-                    'Authorization'  = "Bearer $tok"
-                    'anthropic-beta' = 'oauth-2025-04-20'
-                    'User-Agent'     = 'claude-code/2.0.31'
-                    'Accept'         = 'application/json'
-                }
-                $q = Invoke-RestMethod -Uri 'https://api.anthropic.com/api/oauth/usage' -Headers $headers -Method GET -TimeoutSec 10 -ErrorAction Stop
-            } catch {
-                $q = $null
-                $qErr = $_.Exception.Message
-            }
-        } elseif (-not $tok) {
-            $qErr = 'no OAuth token in ~/.claude/.credentials.json'
-        } elseif ($skip) {
-            $qErr = 'forceLocalMode is on - API skipped'
+function Fetch-Quota([string]$token) {
+    if (-not $token) {
+        return @{ quota = $null; quotaErr = 'no OAuth token in ~/.claude/.credentials.json' }
+    }
+    try {
+        $headers = @{
+            'Authorization'  = "Bearer $token"
+            'anthropic-beta' = 'oauth-2025-04-20'
+            'User-Agent'     = 'claude-code/2.0.31'
+            'Accept'         = 'application/json'
         }
-        return @{ blocksRaw = $b; weeklyRaw = $w; quota = $q; quotaErr = $qErr }
+        $q = Invoke-RestMethod -Uri 'https://api.anthropic.com/api/oauth/usage' -Headers $headers -Method GET -TimeoutSec 10 -ErrorAction Stop
+        return @{ quota = $q; quotaErr = $null }
+    } catch {
+        $msg = $_.Exception.Message
+        try {
+            $code = [int]$_.Exception.Response.StatusCode
+            if ($code -gt 0) {
+                $msg = switch ($code) {
+                    429     { '429 rate limited' }
+                    401     { '401 expired token' }
+                    403     { '403 forbidden' }
+                    default { "HTTP $code" }
+                }
+            }
+        } catch {}
+        return @{ quota = $null; quotaErr = $msg }
     }
 }
 
@@ -414,36 +411,12 @@ function Parse-ResetMin($iso) {
 # ---------------------------------------------------------------------------
 function Render-Frame {
     param(
-        $blocks, $weekly, $quota, $quotaErr,
+        $quota, $quotaErr,
         [bool]$fetching, [int]$secsUntilNext, [int]$spinIdx, [bool]$everFetched,
         [bool]$paused
     )
 
     $cfg = $script:Config
-
-    # Local ccusage data
-    $active = $null
-    if ($blocks -and $blocks.blocks) {
-        $active = $blocks.blocks | Where-Object { $_.isActive -eq $true } | Select-Object -First 1
-    }
-
-    $latestWk = $null
-    $peakWkTokens = 0
-    if ($weekly -and $weekly.weekly) {
-        $latestWk = $weekly.weekly | Select-Object -First 1
-        $peakWkTokens = ($weekly.weekly | Measure-Object -Property totalTokens -Maximum).Maximum
-    }
-
-    $sonnetTokensLocal = 0.0
-    $sonnetCostLocal   = 0.0
-    if ($latestWk -and $latestWk.modelBreakdowns) {
-        foreach ($mb in $latestWk.modelBreakdowns) {
-            if ($mb.modelName -like '*sonnet*') {
-                $sonnetTokensLocal += [double]($mb.inputTokens + $mb.outputTokens + $mb.cacheCreationTokens + $mb.cacheReadTokens)
-                $sonnetCostLocal   += [double]$mb.cost
-            }
-        }
-    }
 
     Update-Layout | Out-Null
 
@@ -486,16 +459,6 @@ function Render-Frame {
             if (-not $cfg.compactMode) {
                 $info = ''
                 if ($remMin -ge 0) { $info = "Resets in $(Fmt-Dur $remMin)" }
-                if ($active) {
-                    $tu = [double]$active.totalTokens
-                    $co = [double]$active.costUSD
-                    if ($info) { $info += '  ' }
-                    if ($cfg.showCost) {
-                        $info += "$(Fmt-Tokens $tu) tok  `$" + ('{0:N2}' -f $co)
-                    } else {
-                        $info += "$(Fmt-Tokens $tu) tok"
-                    }
-                }
                 [void]$sb.AppendLine($INDENT + $script:GRY + (Truncate-Vis $info) + $script:R + $EOL)
             }
         } else {
@@ -503,22 +466,6 @@ function Render-Frame {
             [void]$sb.AppendLine($INDENT + $script:YEL + (Truncate-Vis $msg) + $script:R + $EOL)
             [void]$sb.AppendLine($EOL)
             if (-not $cfg.compactMode) { [void]$sb.AppendLine($EOL) }
-        }
-
-        # Burn rate sub-line
-        if ($cfg.showBurnRate -and -not $cfg.compactMode) {
-            if ($active) {
-                $bt = [double]$active.burnRate.tokensPerMinute
-                $bh = [double]$active.burnRate.costPerHour
-                if ($cfg.showCost) {
-                    $burnLine = "Burn $(Fmt-Tokens $bt)/m | `$" + ('{0:N2}' -f $bh) + '/h'
-                } else {
-                    $burnLine = "Burn $(Fmt-Tokens $bt)/m"
-                }
-                [void]$sb.AppendLine($INDENT + $script:GRY + (Truncate-Vis $burnLine) + $script:R + $EOL)
-            } else {
-                [void]$sb.AppendLine($EOL)
-            }
         }
 
         if (-not $cfg.compactMode) { [void]$sb.AppendLine($EOL) }
@@ -542,14 +489,6 @@ function Render-Frame {
                 if (-not $cfg.compactMode) {
                     $wkInfo = ''
                     if ($wkRem -ge 0) { $wkInfo = "Resets in $(Fmt-Dur $wkRem)" }
-                    if ($latestWk) {
-                        if ($wkInfo) { $wkInfo += '  ' }
-                        if ($cfg.showCost) {
-                            $wkInfo += "$(Fmt-Tokens $latestWk.totalTokens) tok  `$" + ('{0:N2}' -f [double]$latestWk.totalCost)
-                        } else {
-                            $wkInfo += "$(Fmt-Tokens $latestWk.totalTokens) tok"
-                        }
-                    }
                     [void]$sb.AppendLine($INDENT + $script:GRY + (Truncate-Vis $wkInfo) + $script:R + $EOL)
                 }
             } else {
@@ -580,14 +519,6 @@ function Render-Frame {
                 if (-not $cfg.compactMode) {
                     $snInfo = ''
                     if ($snRem -ge 0) { $snInfo = "Resets in $(Fmt-Dur $snRem)" }
-                    if ($sonnetTokensLocal -gt 0) {
-                        if ($snInfo) { $snInfo += '  ' }
-                        if ($cfg.showCost) {
-                            $snInfo += "$(Fmt-Tokens $sonnetTokensLocal) tok  `$" + ('{0:N2}' -f $sonnetCostLocal)
-                        } else {
-                            $snInfo += "$(Fmt-Tokens $sonnetTokensLocal) tok"
-                        }
-                    }
                     [void]$sb.AppendLine($INDENT + $script:GRY + (Truncate-Vis $snInfo) + $script:R + $EOL)
                 }
             } else {
@@ -632,7 +563,15 @@ function Render-Frame {
         $statusLine = "$spinCh refreshing data..."
         $statusAnsi = $script:CYA + $statusLine + $script:R
     } elseif ($everFetched) {
-        if ($script:CONTENT_W -ge 38) {
+        if ($cfg.interval -le 0) {
+            if ($script:CONTENT_W -ge 38) {
+                $statusLine = 'Enter to refresh | c menu  q quit'
+            } elseif ($script:CONTENT_W -ge 24) {
+                $statusLine = 'Enter refresh | c menu'
+            } else {
+                $statusLine = 'Enter refresh'
+            }
+        } elseif ($script:CONTENT_W -ge 38) {
             $statusLine = ('next in ' + $secsUntilNext + 's | c menu  q quit')
         } elseif ($script:CONTENT_W -ge 24) {
             $statusLine = ('next ' + $secsUntilNext + 's | c menu')
@@ -685,7 +624,7 @@ function CyclePrev { param([array]$arr, $cur)
 function Get-MenuItems {
     param($cfg)
     return @(
-        @{ key='interval';       label='Refresh interval'; help='Refresh interval (5-3600 sec)';            type='int';    val=$cfg.interval }
+        @{ key='interval';       label='Refresh interval'; help='0 = manual (Enter to fetch), else 5-3600 sec'; type='int';    val=$cfg.interval }
         @{ key='theme';          label='Color theme';      help='default / dark / mono / high-contrast';    type='cycle';  val=$cfg.theme;    options=$THEMES }
         @{ key='corner';         label='Window corner';    help='Screen corner where the window parks';     type='cycle';  val=$cfg.corner;   options=$CORNERS }
         @{ key='dimensions';     label='Window size';      help='Window size as cols x rows (e.g. 48x28)';  type='dims';   val=$cfg.dimensions }
@@ -695,12 +634,9 @@ function Get-MenuItems {
         @{ key='barStyle';       label='Bar style';        help='block / ascii / braille glyphs';           type='cycle';  val=$cfg.barStyle; options=$BAR_STYLES }
         @{ key='showWeekly';     label='Show Weekly';      help='Show the 7-day quota panel';               type='bool';   val=$cfg.showWeekly }
         @{ key='showSonnet';     label='Show Sonnet';      help='Show the Weekly Sonnet panel';             type='bool';   val=$cfg.showSonnet }
-        @{ key='showBurnRate';   label='Show Burn rate';   help='Show tokens-per-minute burn line';         type='bool';   val=$cfg.showBurnRate }
-        @{ key='showCost';       label='Show Cost';        help='Display $ cost amounts';                   type='bool';   val=$cfg.showCost }
         @{ key='compactMode';    label='Compact mode';     help='Hide info sub-lines for a shorter UI';     type='bool';   val=$cfg.compactMode }
         @{ key='alertThreshold'; label='Alert threshold';  help='Bar turns red when % is at/above this';    type='int';    val=$cfg.alertThreshold }
         @{ key='spinner';        label='Spinner';          help='Animated spinner glyph (reduced motion)';  type='bool';   val=$cfg.spinner }
-        @{ key='forceLocalMode'; label='Force local mode'; help='Skip OAuth API call - use peak fallback';  type='bool';   val=$cfg.forceLocalMode }
     )
 }
 
@@ -709,7 +645,14 @@ function Format-MenuValue {
     switch ($item.type) {
         'bool'      { if ($item.val) { return '[x] on' } else { return '[ ] off' } }
         'dims'      { return ('{0} x {1}' -f $item.val.cols, $item.val.rows) }
-        'int'       { if ($item.key -eq 'alertThreshold') { return ('{0}%' -f $item.val) } if ($item.key -eq 'interval') { return ('{0}s' -f $item.val) } return [string]$item.val }
+        'int'       {
+            if ($item.key -eq 'alertThreshold') { return ('{0}%' -f $item.val) }
+            if ($item.key -eq 'interval') {
+                if ([int]$item.val -eq 0) { return 'manual' }
+                return ('{0}s' -f $item.val)
+            }
+            return [string]$item.val
+        }
         default     { return [string]$item.val }
     }
 }
@@ -999,8 +942,11 @@ function Show-SetupMenu {
                     if ($newVal -match '^\d+$') {
                         $iv = [int]$newVal
                         if ($it.key -eq 'interval') {
-                            if ($iv -lt 5)    { $iv = 5 }
-                            if ($iv -gt 3600) { $iv = 3600 }
+                            # 0 is a valid sentinel (manual mode); otherwise clamp.
+                            if ($iv -ne 0) {
+                                if ($iv -lt 5)    { $iv = 5 }
+                                if ($iv -gt 3600) { $iv = 3600 }
+                            }
                         } elseif ($it.key -eq 'alertThreshold') {
                             if ($iv -lt 0)   { $iv = 0 }
                             if ($iv -gt 100) { $iv = 100 }
@@ -1055,8 +1001,8 @@ function Show-SetupMenu {
 # ---------------------------------------------------------------------------
 $script:Config = Load-Config
 
-# CLI override for interval (does not persist)
-if ($Interval -gt 0) { $script:Config.interval = $Interval }
+# CLI override for interval (does not persist). 0 = manual mode.
+if ($Interval -ge 0) { $script:Config.interval = $Interval }
 
 Apply-Config -cfg $script:Config -Initial $true
 
@@ -1064,19 +1010,21 @@ Clear-Host
 [Console]::Write($HIDE)
 
 $token         = Get-OAuthToken
-$lastBlocks    = $null
-$lastWeekly    = $null
 $lastQuota     = $null
 $lastQuotaErr  = $null
 $lastFetchTime = [datetime]::MinValue
 $everFetched   = $false
-$bgFetch       = $null
 $spinIdx       = 0
 $lastWindowW   = -1
 $paused        = $false
 $forceRefresh  = $false
 
-$bgFetch = Start-FetchJob $token ([bool]$script:Config.forceLocalMode)
+# First fetch is inline before the render loop starts.
+$fetchResult   = Fetch-Quota $token
+$lastQuota     = $fetchResult.quota
+$lastQuotaErr  = $fetchResult.quotaErr
+$lastFetchTime = Get-Date
+$everFetched   = $true
 
 # Detect whether we have an interactive console. When stdin is redirected
 # (e.g. piped, scheduled task without a window, CI), [Console]::KeyAvailable
@@ -1086,26 +1034,19 @@ try { [void][Console]::KeyAvailable } catch { $script:KeyboardAvailable = $false
 
 try {
     while ($true) {
-        if ($null -ne $bgFetch -and $bgFetch.State -ne 'Running' -and $bgFetch.State -ne 'NotStarted') {
-            $result = Receive-Job $bgFetch -ErrorAction SilentlyContinue
-            Remove-Job $bgFetch -Force -ErrorAction SilentlyContinue
-            $bgFetch = $null
-            $lastFetchTime = Get-Date
-            $everFetched = $true
-            if ($result) {
-                try { if ($result.blocksRaw) { $lastBlocks = $result.blocksRaw | ConvertFrom-Json } } catch {}
-                try { if ($result.weeklyRaw) { $lastWeekly = $result.weeklyRaw | ConvertFrom-Json } } catch {}
-                $lastQuota    = $result.quota
-                $lastQuotaErr = $result.quotaErr
-            }
-        }
-
         $elapsed = if ($lastFetchTime -eq [datetime]::MinValue) { 99999 } else { ((Get-Date) - $lastFetchTime).TotalSeconds }
         $secsLeft = [int][math]::Max(0, $script:Config.interval - $elapsed)
 
-        if ($null -eq $bgFetch -and $everFetched -and -not $paused -and ($elapsed -ge $script:Config.interval -or $forceRefresh)) {
-            $bgFetch = Start-FetchJob $token ([bool]$script:Config.forceLocalMode)
-            $forceRefresh = $false
+        # interval=0 disables auto-polling; only $forceRefresh (Enter / 'r') fires a fetch.
+        # Manual refresh is debounced to ~2s so spamming Enter can't hit the rate limit.
+        $autoDue      = ($script:Config.interval -gt 0 -and $elapsed -ge $script:Config.interval)
+        $manualDue    = ($forceRefresh -and $elapsed -ge 2)
+        $forceRefresh = $false
+        if (-not $paused -and ($autoDue -or $manualDue)) {
+            $fetchResult   = Fetch-Quota $token
+            $lastQuota     = $fetchResult.quota
+            $lastQuotaErr  = $fetchResult.quotaErr
+            $lastFetchTime = Get-Date
         }
 
         $curW = 0
@@ -1121,10 +1062,8 @@ try {
             Set-AlwaysOnTop -On $true
         }
 
-        $fetching = ($null -ne $bgFetch)
-        Render-Frame -blocks $lastBlocks -weekly $lastWeekly -quota $lastQuota `
-                     -quotaErr $lastQuotaErr `
-                     -fetching $fetching -secsUntilNext $secsLeft `
+        Render-Frame -quota $lastQuota -quotaErr $lastQuotaErr `
+                     -fetching $false -secsUntilNext $secsLeft `
                      -spinIdx $spinIdx -everFetched $everFetched -paused $paused
 
         $spinIdx++
@@ -1141,13 +1080,14 @@ try {
                 if ($keyReady) {
                     $k = [Console]::ReadKey($true)
                     $kch = $k.KeyChar
+                    $kc  = $k.Key
                     if ($kch -eq 'c' -or $kch -eq 'C' -or $kch -eq '?') {
                         [void](Show-SetupMenu ([ref]$script:Config))
                         $lastWindowW = -1   # force redraw at new size
                         break
                     } elseif ($kch -eq 'q' -or $kch -eq 'Q') {
                         $shouldQuit = $true; break
-                    } elseif ($kch -eq 'r' -or $kch -eq 'R') {
+                    } elseif ($kch -eq 'r' -or $kch -eq 'R' -or $kc -eq [ConsoleKey]::Enter) {
                         $forceRefresh = $true; break
                     } elseif ($kch -eq 'p' -or $kch -eq 'P') {
                         $paused = -not $paused; break
@@ -1160,9 +1100,5 @@ try {
     }
 }
 finally {
-    if ($null -ne $bgFetch) {
-        try { Stop-Job $bgFetch -ErrorAction SilentlyContinue } catch {}
-        try { Remove-Job $bgFetch -Force -ErrorAction SilentlyContinue } catch {}
-    }
     [Console]::Write($SHOW + $script:R + "`n")
 }
